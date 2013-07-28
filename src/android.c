@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <pwd.h>
 #include <grp.h>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/types.h>
@@ -18,6 +19,7 @@
 #include <selinux/label.h>
 #include <selinux/avc.h>
 #include <private/android_filesystem_config.h>
+#include "policy.h"
 #include "callbacks.h"
 #include "selinux_internal.h"
 
@@ -28,19 +30,40 @@
  * on app data directories.
  */
 static char const * const seapp_contexts_file[] = {
-	"/data/system/seapp_contexts",
+	"/data/security/current/seapp_contexts",
 	"/seapp_contexts",
 	0 };
 
 static const struct selinux_opt seopts[] = {
-	{ SELABEL_OPT_PATH, "/data/system/file_contexts" },
+	{ SELABEL_OPT_PATH, "/data/security/current/file_contexts" },
+	{ SELABEL_OPT_PATH, "/file_contexts" },
+	{ 0, NULL } };
+
+static const struct selinux_opt seopt_backup[] = {
+	{ SELABEL_OPT_PATH, "/data/security/current/file_contexts_backup" },
 	{ SELABEL_OPT_PATH, "/file_contexts" },
 	{ 0, NULL } };
 
 static const char *const sepolicy_file[] = {
-        "/data/system/sepolicy",
+        "/data/security/current/sepolicy",
         "/sepolicy",
         0 };
+
+enum levelFrom {
+	LEVELFROM_NONE,
+	LEVELFROM_APP,
+	LEVELFROM_USER,
+	LEVELFROM_ALL
+};
+
+#if DEBUG
+static char const * const levelFromName[] = {
+	"none",
+	"app",
+	"user",
+	"all"
+};
+#endif
 
 struct seapp_context {
 	/* input selectors */
@@ -55,12 +78,12 @@ struct seapp_context {
 	char *type;
 	char *level;
 	char *sebool;
-	char levelFromUid;
+	enum levelFrom levelFrom;
 };
 
 static int seapp_context_cmp(const void *A, const void *B)
 {
-	const struct seapp_context **sp1 = A, **sp2 = B;
+	const struct seapp_context *const *sp1 = A, *const *sp2 = B;
 	const struct seapp_context *s1 = *sp1, *s2 = *sp2;
 
 	/* Give precedence to isSystemServer=true. */
@@ -202,9 +225,21 @@ int selinux_android_seapp_context_reload(void)
 					goto oom;
 			} else if (!strcasecmp(name, "levelFromUid")) {
 				if (!strcasecmp(value, "true"))
-					cur->levelFromUid = 1;
+					cur->levelFrom = LEVELFROM_APP;
 				else if (!strcasecmp(value, "false"))
-					cur->levelFromUid = 0;
+					cur->levelFrom = LEVELFROM_NONE;
+				else {
+					goto err;
+				}
+			} else if (!strcasecmp(name, "levelFrom")) {
+				if (!strcasecmp(value, "none"))
+					cur->levelFrom = LEVELFROM_NONE;
+				else if (!strcasecmp(value, "app"))
+					cur->levelFrom = LEVELFROM_APP;
+				else if (!strcasecmp(value, "user"))
+					cur->levelFrom = LEVELFROM_USER;
+				else if (!strcasecmp(value, "all"))
+					cur->levelFrom = LEVELFROM_ALL;
 				else {
 					goto err;
 				}
@@ -237,12 +272,12 @@ int selinux_android_seapp_context_reload(void)
 		int i;
 		for (i = 0; i < nspec; i++) {
 			cur = seapp_contexts[i];
-			selinux_log(SELINUX_INFO, "%s:  isSystemServer=%s user=%s seinfo=%s name=%s sebool=%s -> domain=%s type=%s level=%s levelFromUid=%s",
+			selinux_log(SELINUX_INFO, "%s:  isSystemServer=%s user=%s seinfo=%s name=%s sebool=%s -> domain=%s type=%s level=%s levelFrom=%s",
 			__FUNCTION__,
 			cur->isSystemServer ? "true" : "false", cur->user,
 			cur->seinfo, cur->name, cur->sebool, cur->domain,
 			cur->type, cur->level,
-			cur->levelFromUid ? "true" : "false");
+			levelFromName[cur->levelFrom]);
 		}
 	}
 #endif
@@ -273,9 +308,18 @@ static void seapp_context_init(void)
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 
-#define SEAPP_TYPE 1
-#define SEAPP_DOMAIN 2
-static int seapp_context_lookup(int kind,
+/*
+ * Max id that can be mapped to category set uniquely
+ * using the current scheme.
+ */
+#define CAT_MAPPING_MAX_ID (0x1<<16)
+
+enum seapp_kind {
+	SEAPP_TYPE,
+	SEAPP_DOMAIN
+};
+
+static int seapp_context_lookup(enum seapp_kind kind,
 				uid_t uid,
 				int isSystemServer,
 				const char *seinfo,
@@ -288,8 +332,10 @@ static int seapp_context_lookup(int kind,
 	struct seapp_context *cur;
 	int i;
 	size_t n;
-	uid_t appid = 0;
+	uid_t userid;
+	uid_t appid;
 
+	userid = uid / AID_USER;
 	appid = uid % AID_USER;
 	if (appid < AID_APP) {
 		for (n = 0; n < android_id_count; n++) {
@@ -301,14 +347,14 @@ static int seapp_context_lookup(int kind,
 		if (!username)
 			goto err;
 	} else if (appid < AID_ISOLATED_START) {
-		username = "app_";
+		username = "_app";
 		appid -= AID_APP;
 	} else {
-		username = "isolated";
+		username = "_isolated";
 		appid -= AID_ISOLATED_START;
 	}
 
-	if (appid >= MLS_CATS)
+	if (appid >= CAT_MAPPING_MAX_ID || userid >= CAT_MAPPING_MAX_ID)
 		goto err;
 
 	for (i = 0; i < nspec; i++) {
@@ -361,10 +407,30 @@ static int seapp_context_lookup(int kind,
 				goto oom;
 		}
 
-		if (cur->levelFromUid) {
+		if (cur->levelFrom != LEVELFROM_NONE) {
 			char level[255];
-			snprintf(level, sizeof level, "%s:c%lu",
-				 context_range_get(ctx), appid);
+			switch (cur->levelFrom) {
+			case LEVELFROM_APP:
+				snprintf(level, sizeof level, "%s:c%u,c%u",
+					 context_range_get(ctx), appid & 0xff,
+					 256 + (appid>>8 & 0xff));
+				break;
+			case LEVELFROM_USER:
+				snprintf(level, sizeof level, "%s:c%u,c%u",
+					 context_range_get(ctx),
+					 512 + (userid & 0xff),
+					 768 + (userid>>8 & 0xff));
+				break;
+			case LEVELFROM_ALL:
+				snprintf(level, sizeof level, "%s:c%u,c%u,c%u,c%u",
+					 context_range_get(ctx), appid & 0xff,
+					 256 + (appid>>8 & 0xff),
+					 512 + (userid & 0xff),
+					 768 + (userid>>8 & 0xff));
+				break;
+			default:
+				goto err;
+			}
 			if (context_range_set(ctx, level))
 				goto oom;
 		} else if (cur->level) {
@@ -513,12 +579,12 @@ out:
 err:
 	if (isSystemServer)
 		selinux_log(SELINUX_ERROR,
-			    "%s:  Error setting context for system server: %s\n",
-			    __FUNCTION__, strerror(errno));
+				"%s:  Error setting context for system server: %s\n",
+				__FUNCTION__, strerror(errno));
 	else 
 		selinux_log(SELINUX_ERROR,
-			    "%s:  Error setting context for app with uid %d, seinfo %s: %s\n",
-			    __FUNCTION__, uid, seinfo, strerror(errno));
+				"%s:  Error setting context for app with uid %d, seinfo %s: %s\n",
+				__FUNCTION__, uid, seinfo, strerror(errno));
 
 	rc = -1;
 	goto out;
@@ -530,20 +596,40 @@ oom:
 
 static struct selabel_handle *sehandle = NULL;
 
-static struct selabel_handle *file_context_open(void)
-{
+static struct selabel_handle *get_selabel_handle(const struct selinux_opt opts[]) {
 	struct selabel_handle *h;
 	int i = 0;
 
 	h = NULL;
-	while ((h == NULL) && seopts[i].value) {
-		h = selabel_open(SELABEL_CTX_FILE, &seopts[i], 1);
+	while ((h == NULL) && opts[i].value) {
+		h = selabel_open(SELABEL_CTX_FILE, &opts[i], 1);
 		i++;
 	}
 
+	return h;
+}
+
+static struct selabel_handle *file_context_open(void)
+{
+	struct selabel_handle *h;
+
+	h = get_selabel_handle(seopts);
+
 	if (!h)
-		selinux_log(SELINUX_ERROR, "%s: Error getting sehandle label (%s)\n",
-			    __FUNCTION__, strerror(errno));
+		selinux_log(SELINUX_ERROR, "%s: Error getting file context handle (%s)\n",
+				__FUNCTION__, strerror(errno));
+	return h;
+}
+
+static struct selabel_handle *file_context_backup_open(void)
+{
+	struct selabel_handle *h;
+
+	h = get_selabel_handle(seopt_backup);
+
+	if (!h)
+		selinux_log(SELINUX_ERROR, "%s: Error getting backup file context handle (%s)\n",
+				__FUNCTION__, strerror(errno));
 	return h;
 }
 
@@ -556,6 +642,9 @@ static pthread_once_t fc_once = PTHREAD_ONCE_INIT;
 
 int selinux_android_restorecon(const char *pathname)
 {
+
+	if (is_selinux_enabled() <= 0)
+		return 0;
 
 	__selinux_once(fc_once, file_context_init);
 
@@ -600,24 +689,143 @@ bail:
 	goto out;
 }
 
+static int file_requires_fixup(const char *pathname,
+		struct selabel_handle *sehandle_old,
+		struct selabel_handle *sehandle_new)
+{
+	int ret;
+	struct stat sb;
+	char *current_context, *old_context, *new_context;
+
+	ret = 0;
+	old_context = NULL;
+	new_context = NULL;
+	current_context = NULL;
+
+	if (lstat(pathname, &sb) < 0) {
+		ret = -1;
+		goto err;
+	}
+
+	if (lgetfilecon(pathname, &current_context) < 0) {
+		ret = -1;
+		goto err;
+	}
+
+	if (selabel_lookup(sehandle_old, &old_context, pathname, sb.st_mode) < 0) {
+		ret = -1;
+		goto err;
+	}
+
+	if (selabel_lookup(sehandle_new, &new_context, pathname, sb.st_mode) < 0) {
+		ret = -1;
+		goto err;
+	}
+
+	if (strstr(current_context, "unlabeled") != NULL) {
+		ret = 1;
+		goto out;
+	}
+
+	ret = (strcmp(old_context, new_context) && !strcmp(current_context, old_context));
+	goto out;
+
+err:
+	selinux_log(SELINUX_ERROR,
+		"%s:  Error comparing context for %s (%s)\n",
+		__FUNCTION__,
+		pathname,
+		strerror(errno));
+
+out:
+	if (current_context)
+		freecon(current_context);
+	if (new_context)
+		freecon(new_context);
+	if (old_context)
+		freecon(old_context);
+	return ret;
+}
+
+static int fixcon_file(const char *pathname,
+		struct selabel_handle *sehandle_old,
+		struct selabel_handle *sehandle_new)
+{
+	int requires_fixup;
+
+	requires_fixup = file_requires_fixup(pathname, sehandle_old, sehandle_new);
+	if (requires_fixup < 0)
+		return -1;
+
+	if (requires_fixup)
+		selinux_android_restorecon(pathname);
+
+	return 0;
+}
+
+static int fixcon_recursive(const char *pathname,
+		struct selabel_handle *sehandle_old,
+		struct selabel_handle *sehandle_new)
+{
+	struct stat statresult;
+	if (lstat(pathname, &statresult) < 0)
+		return -1;
+
+	if (!S_ISDIR(statresult.st_mode))
+		return fixcon_file(pathname, sehandle_old, sehandle_new);
+
+	DIR *dir = opendir(pathname);
+	if (dir == NULL)
+		return -1;
+
+	struct dirent *entry;
+	while ((entry = readdir(dir)) != NULL) {
+		char *entryname;
+		if (!strcmp(entry->d_name, ".."))
+			continue;
+		if (!strcmp(entry->d_name, "."))
+			continue;
+		if (asprintf(&entryname, "%s/%s", pathname, entry->d_name) == -1)
+			continue;
+		fixcon_recursive(entryname, sehandle_old, sehandle_new);
+		free(entryname);
+	}
+
+	if (closedir(dir) < 0)
+		return -1;
+
+	return fixcon_file(pathname, sehandle_old, sehandle_new);
+}
+
+int selinux_android_fixcon(const char *pathname)
+{
+	struct selabel_handle *sehandle_old, *sehandle_new;
+
+	sehandle_old = file_context_backup_open();
+	if (sehandle_old == NULL)
+		return -1;
+
+	sehandle_new = file_context_open();
+	if (sehandle_new == NULL)
+		return -1;
+
+	return fixcon_recursive(pathname, sehandle_old, sehandle_new);
+}
 
 struct selabel_handle* selinux_android_file_context_handle(void)
 {
-        return file_context_open();
+		return file_context_open();
 }
 
 int selinux_android_reload_policy(void)
 {
-	char path[PATH_MAX];
 	int fd = -1, rc;
 	struct stat sb;
 	void *map = NULL;
 	int i = 0;
 
 	while (fd < 0 && sepolicy_file[i]) {
-		snprintf(path, sizeof(path), "%s",
-			sepolicy_file[i]);
-		fd = open(path, O_RDONLY);
+		fd = open(sepolicy_file[i], O_RDONLY | O_NOFOLLOW);
 		i++;
 	}
 	if (fd < 0) {
@@ -627,14 +835,14 @@ int selinux_android_reload_policy(void)
 	}
 	if (fstat(fd, &sb) < 0) {
 		selinux_log(SELINUX_ERROR, "SELinux:  Could not stat %s:  %s\n",
-				path, strerror(errno));
+				sepolicy_file[i], strerror(errno));
 		close(fd);
 		return -1;
 	}
 	map = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 	if (map == MAP_FAILED) {
 		selinux_log(SELINUX_ERROR, "SELinux:  Could not map %s:  %s\n",
-			path, strerror(errno));
+			sepolicy_file[i], strerror(errno));
 		close(fd);
 		return -1;
 	}
@@ -650,24 +858,39 @@ int selinux_android_reload_policy(void)
 
 	munmap(map, sb.st_size);
 	close(fd);
-	selinux_log(SELINUX_INFO, "SELinux: Loaded policy from %s\n", path);
+	selinux_log(SELINUX_INFO, "SELinux: Loaded policy from %s\n", sepolicy_file[i]);
 
 	return 0;
 }
 
 int selinux_android_load_policy(void)
 {
-	mkdir(SELINUXMNT, 0755);
-	if (mount("selinuxfs", SELINUXMNT, "selinuxfs", 0, NULL)) {
+	char *mnt = SELINUXMNT;
+	int rc;
+	rc = mount(SELINUXFS, mnt, SELINUXFS, 0, NULL);
+	if (rc < 0) {
 		if (errno == ENODEV) {
 			/* SELinux not enabled in kernel */
 			return -1;
 		}
+		if (errno == ENOENT) {
+			/* Fall back to legacy mountpoint. */
+			mnt = OLDSELINUXMNT;
+			rc = mkdir(mnt, 0755);
+			if (rc == -1 && errno != EEXIST) {
+				selinux_log(SELINUX_ERROR,"SELinux:  Could not mkdir:  %s\n",
+					strerror(errno));
+				return -1;
+			}
+			rc = mount(SELINUXFS, mnt, SELINUXFS, 0, NULL);
+		}
+	}
+	if (rc < 0) {
 		selinux_log(SELINUX_ERROR,"SELinux:  Could not mount selinuxfs:  %s\n",
 				strerror(errno));
 		return -1;
 	}
-	set_selinuxmnt(SELINUXMNT);
+	set_selinuxmnt(mnt);
 
 	return selinux_android_reload_policy();
 }
